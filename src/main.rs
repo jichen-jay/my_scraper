@@ -1,7 +1,10 @@
 use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::{Deserialize, Deserializer};
-use std::{fs, process::Command};
-use tokio::time::{sleep, Duration};
+use std::error::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+const END_OF_MESSAGE: &str = "<END_OF_MESSAGE>";
 
 #[derive(Deserialize)]
 struct ScrapeParams {
@@ -11,34 +14,15 @@ struct ScrapeParams {
 
 async fn scrape(Json(params): Json<ScrapeParams>) -> impl IntoResponse {
     if let Some(url) = params.url {
-        let _ = Command::new("rm").arg("output.md").status();
+        println!("Received URL from HTTP request: {}", url);
 
-        let _ = Command::new("node").arg("bundle.js").arg(&url).output();
-
-        sleep(Duration::from_secs(3)).await;
-
-        let mut elapsed_time = 0;
-        while elapsed_time < 25 {
-            if fs::metadata("output.md").is_ok() {
-                match fs::read_to_string("output.md") {
-                    Ok(scraped_text) => return (StatusCode::OK, scraped_text),
-                    Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to read output file: {}", e),
-                        )
-                    }
-                }
-            }
-
-            sleep(Duration::from_secs(3)).await;
-            elapsed_time += 3;
+        match send_url_to_js_server(&url).await {
+            Ok(scraped_text) => (StatusCode::OK, scraped_text),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to scrape URL: {}", e),
+            ),
         }
-
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Timeout waiting for output file".to_string(),
-        )
     } else {
         (
             StatusCode::BAD_REQUEST,
@@ -61,4 +45,41 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn send_url_to_js_server(url: &str) -> Result<String, Box<dyn Error>> {
+    let mut stream = TcpStream::connect("127.0.0.1:4000").await?;
+    let mut reader = BufReader::new(stream);
+
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", url).as_bytes())
+        .await?;
+    println!("URL sent to JS server.");
+
+    let mut buffer = vec![0; 65_535]; // Buffer for reading data
+    let mut complete_message = String::new();
+
+    loop {
+        let n = reader.read(&mut buffer).await?;
+
+        if n == 0 {
+            println!("Connection closed by JS server.");
+            break;
+        }
+
+        complete_message.push_str(&String::from_utf8_lossy(&buffer[..n]));
+
+        if complete_message.contains(END_OF_MESSAGE) {
+            complete_message = complete_message.replace(END_OF_MESSAGE, "");
+            println!(
+                "Complete message received from JS server: {}",
+                complete_message
+            );
+
+            return Ok(complete_message);
+        }
+    }
+
+    Err(Box::from("Unexpected end of communication"))
 }
